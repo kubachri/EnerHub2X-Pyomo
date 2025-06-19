@@ -7,7 +7,7 @@ import numpy as np
 
 # directory containing all the .inc files
 INC_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), '../..', 'inc_data')
+    os.path.join(os.path.dirname(__file__), '../..', 'inc_data_Electrolyser100')
 )
 
 
@@ -216,25 +216,59 @@ def load_price():
 def load_profile():
     """
     Parse Profile.inc → DataFrame indexed by Hour-*, columns = each tech.
+    Handles wrapped rows via stitching, and computes true column spans
+    via regex rather than header.index().
     """
     path = os.path.join(INC_DIR, "Profile.inc")
     with open(path, encoding='utf-8') as f:
         lines = f.readlines()
 
+    # 1) Find header line
     hdr = next(i for i, L in enumerate(lines)
                if L.strip() and not L.lstrip().startswith("*") and not L.lstrip().startswith("Table"))
     header_line = lines[hdr].rstrip("\n")
-    cols        = header_line.split()
-    starts      = [header_line.index(c) for c in cols] + [len(header_line)]
 
-    times, data_rows = [], []
+    # 2) Build cols + exact start/end spans via regex
+    matches = list(re.finditer(r"\S+", header_line))
+    cols   = [m.group() for m in matches]
+    starts = [m.start() for m in matches]
+    ends   = [m.end()   for m in matches] + [len(header_line)]
+
+    # 3) Stitch wrapped rows
+    times          = []
+    data_str_rows  = []
+    current_time   = None
+    current_buffer = ""
+
     for raw in lines[hdr+1:]:
-        if not raw.strip() or raw.lstrip().startswith("*") or raw.strip().startswith("/"): break
-        times.append(raw[:starts[0]].strip())
-        row = [
-            0.0 if raw[starts[j]:starts[j+1]].strip()=="" else float(raw[starts[j]:starts[j+1]].strip())
-            for j in range(len(cols))
-        ]
+        if not raw.strip() or raw.lstrip().startswith("*") or raw.strip().startswith("/"):
+            break
+
+        prefix = raw[:starts[0]]
+        rest   = raw[starts[0]:].rstrip("\n")
+
+        if prefix.strip():
+            # new logical row
+            if current_time is not None:
+                data_str_rows.append(current_buffer)
+            current_time   = prefix.strip()
+            times.append(current_time)
+            current_buffer = rest
+        else:
+            # continuation
+            current_buffer += rest
+
+    # append last
+    if current_time is not None:
+        data_str_rows.append(current_buffer)
+
+    # 4) Slice each logical row into floats
+    data_rows = []
+    for row_str in data_str_rows:
+        row = []
+        for j in range(len(cols)):
+            cell = row_str[starts[j]-starts[0] : ends[j]-starts[0]].strip()
+            row.append(0.0 if cell == "" else float(cell))
         data_rows.append(row)
 
     return pd.DataFrame(data_rows, index=times, columns=cols)

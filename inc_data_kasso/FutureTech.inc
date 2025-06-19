@@ -1,0 +1,22 @@
+SET FutureTech(tech)
+/                   
+ElectricStorage     
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+/;                  
