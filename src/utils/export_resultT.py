@@ -6,13 +6,17 @@ from pathlib import Path
 
 def export_results(model, path: str = None):
     """
-    Export GAMS‐style ResultT, ResultF, ResultA and ResultC tables to Excel.
+    Export GAMS‐style ResultT, ResultF, ResultA and ResultC tables to Excel,
+    plus sum‐pivot summaries for T, F and A.
 
     Sheets produced:
-      - ResultT_all   (Operation, Volume, Costs_EUR, Startcost_EUR, Variable_OM_cost_EUR)
-      - Flows         (areaFrom, areaTo, energy)
-      - ResultA_all   (Buy, Sale, Demand, Import_price_EUR, Export_price_EUR, Buy_EUR, Sale_EUR)
-      - ResultC       (hourly CF and summary)
+      - ResultT_all    (hourly: Operation, Volume, Costs_EUR, Startcost_EUR, Variable_OM_cost_EUR)
+      - ResultTsum     (sum over hours per (Result,tech), energies as columns)
+      - Flows          (hourly: areaFrom, areaTo, energy)
+      - ResultFsum     (sum over hours per (areaFrom,areaTo), energies as columns)
+      - ResultA_all    (hourly: Buy, Sale, Demand, Import_price_EUR, Export_price_EUR, Buy_EUR, Sale_EUR)
+      - ResultAsum     (sum over hours per (Result,area), energies as columns; Electricity‐price rows averaged)
+      - ResultC        (hourly CF and summary)
     """
     # 1) compute base path
     if path is None:
@@ -29,7 +33,7 @@ def export_results(model, path: str = None):
     time_cols = [str(t) for t in times]
     ntimes    = len(times)
 
-    # ResultT blocks
+    # --- build hourly ResultT blocks ---
     pairs = set(model.f_in) | set(model.f_out)
 
     # a) Operation
@@ -84,13 +88,13 @@ def export_results(model, path: str = None):
         varom.append(row)
     df_varom = pd.DataFrame(varom)
 
-    # sort and concatenate
+    # sort and concatenate hourly ResultT
     for df in (df_op, df_vol, df_cost, df_start, df_varom):
         df.sort_values(['tech','energy'], inplace=True)
     df_T = pd.concat([df_op, df_vol, df_cost, df_start, df_varom], ignore_index=True)
     df_T = df_T[['Result','tech','energy'] + time_cols]
 
-    # Flows sheet
+    # --- build hourly Flows sheet ---
     flows = []
     for ao, ai, f in model.flowset:
         row = {'areaFrom': ao, 'areaTo': ai, 'energy': f}
@@ -101,9 +105,9 @@ def export_results(model, path: str = None):
     df_F.sort_values(['areaFrom','areaTo','energy'], inplace=True)
     df_F = df_F[['areaFrom','areaTo','energy'] + time_cols]
 
-    # ResultA sheet
+    # --- build hourly ResultA sheet ---
     A_rows = []
-    # 1 & 2) Buy/Sale
+    # Buy & Sale
     for res, varset in (('Buy', model.buyE), ('Sale', model.saleE)):
         for a, e in varset:
             row = {'Result': res, 'area': a, 'energy': e}
@@ -111,25 +115,25 @@ def export_results(model, path: str = None):
                 row[str(t)] = (value(model.Buy[a,e,t]) if res=='Buy'
                                else value(model.Sale[a,e,t]))
             A_rows.append(row)
-    # 3) Demand
-    raw_dem = dict(model.demand.items())
+    # Demand
+    raw_dem   = dict(model.demand.items())
     dem_pairs = sorted({(a,e) for (a,e,t),val in raw_dem.items() if val!=0})
     for a, e in dem_pairs:
         row = {'Result':'Demand','area':a,'energy':e}
         for t in times:
             row[str(t)] = raw_dem.get((a,e,t), 0)
         A_rows.append(row)
-    # 4 & 5) Import/Export prices
+    # Import & Export prices
     for res, price_param, sel in (
         ('Import_price_EUR', model.price_buy,  model.buyE),
-        ('Export_price_EUR', model.price_sale, model.saleE),
+        ('Export_price_EUR', model.price_sale, model.saleE)
     ):
         for a, e in sel:
             row = {'Result':res,'area':a,'energy':e}
             for t in times:
                 row[str(t)] = price_param[a,e,t]
             A_rows.append(row)
-    # 6 & 7) Buy_EUR/Sale_EUR
+    # Buy_EUR & Sale_EUR
     for res, varset, price_param in (
         ('Buy_EUR',  model.buyE,  model.price_buy),
         ('Sale_EUR', model.saleE, model.price_sale),
@@ -148,47 +152,104 @@ def export_results(model, path: str = None):
     df_A.sort_values(['Result','area','energy'], inplace=True)
     df_A = df_A[['Result','area','energy'] + time_cols]
 
-    # ResultC (capacity factors)
+    # --- build hourly ResultC (capacity factors) ---
     C_rows = []
     for tech in model.G:
-        cap = value(model.capacity[tech])
+        cap   = value(model.capacity[tech])
         fuels = [e for (g,e) in model.f_out if g==tech]
-        row = {'Result':'CapacityFactor','tech':tech}
+        row   = {'Result':'CapacityFactor','tech':tech}
         for t in times:
-            gen_sum = sum(value(model.Generation[tech,e,t]) for e in fuels)
+            gen_sum   = sum(value(model.Generation[tech,e,t]) for e in fuels)
             row[str(t)] = gen_sum/cap if cap else 0
         C_rows.append(row)
     df_C_hourly = pd.DataFrame(C_rows, columns=['Result','tech'] + time_cols)
 
-    summary_cf   = []
-    summary_flh  = []
+    summary_cf  = []
+    summary_flh = []
     for tech in model.G:
         cap    = value(model.capacity[tech])
         fuels  = [e for (g,e) in model.f_out if g==tech]
         total  = sum(value(model.Generation[tech,e,t]) for e in fuels for t in times)
         avg_cf = total/(cap*ntimes) if cap else 0
-        summary_cf.append({'Result':'CapacityFactor_Summary',
-                           'tech':tech,'Average_CF':avg_cf})
-        summary_flh.append({'Result':'FullLoadHours',
-                            'tech':tech,'FLH':avg_cf*ntimes})
-    df_C_summary = pd.DataFrame(summary_cf + summary_flh,
-                                columns=['Result','tech','Average_CF','FLH'])
+        summary_cf.append({'Result':'CapacityFactor_Summary','tech':tech,'Average_CF':avg_cf})
+        summary_flh.append({'Result':'FullLoadHours','tech':tech,'FLH':avg_cf*ntimes})
+    df_C_summary = pd.DataFrame(summary_cf + summary_flh, columns=['Result','tech','Average_CF','FLH'])
 
-    # 3) write them all in one loop, bumping filenames on PermissionError
+    # --- build sum‐pivot summaries ---
+
+    # ResultTsum: sum over hours per (Result,tech), energies as columns
+    df_Tsum = (
+        df_T
+          .set_index(['Result','tech','energy'])[time_cols]
+          .sum(axis=1)
+          .unstack(fill_value=0)
+          .reset_index()
+    )
+    block_order_T = ['Operation','Volume','Costs_EUR','Startcost_EUR','Variable_OM_cost_EUR']
+    df_Tsum['Result'] = pd.Categorical(df_Tsum['Result'], categories=block_order_T, ordered=True)
+    df_Tsum.sort_values(['Result','tech'], inplace=True)
+
+    # ResultFsum: sum over hours per (areaFrom,areaTo), energies as columns
+    df_Fsum = (
+        df_F
+          .set_index(['areaFrom','areaTo','energy'])[time_cols]
+          .sum(axis=1)
+          .unstack(fill_value=0)
+          .reset_index()
+    )
+
+    # ResultAsum: sum over hours per (Result,area), energies as columns,
+    # with Electricity price rows averaged instead of summed
+    price_mask = df_A['Result'].isin(['Import_price_EUR','Export_price_EUR'])
+    price_rows = df_A[price_mask].copy()
+    price_rows['PriceValue'] = price_rows.apply(
+        lambda r: r[time_cols].mean() if r['energy']=='Electricity' else r[time_cols[0]],
+        axis=1
+    )
+    df_price = (
+        price_rows
+          .set_index(['Result','area','energy'])['PriceValue']
+          .unstack(level='energy', fill_value=0)
+          .reset_index()
+    )
+    df_nonprice = (
+        df_A[~price_mask]
+          .set_index(['Result','area','energy'])[time_cols]
+          .sum(axis=1)
+          .unstack(fill_value=0)
+          .reset_index()
+    )
+    df_Asum = pd.concat([df_nonprice, df_price], ignore_index=True)
+    df_Asum['Result'] = pd.Categorical(df_Asum['Result'], categories=order, ordered=True)
+    df_Asum.sort_values(['Result','area'], inplace=True)
+
+    # 3) write all sheets in the exact order and with the exact sheet names you asked
     i = 0
     while True:
-        filename = f"{base}{'' if i==0 else f'({i})'}{suffix}"
-        output   = folder / filename
+        filename = f"{base}{'' if i == 0 else f'({i})'}{suffix}"
+        output = folder / filename
         try:
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df_T.to_excel(writer, sheet_name='ResultT_all', index=False)
-                df_F.to_excel(writer, sheet_name='Flows',      index=False)
-                df_A.to_excel(writer, sheet_name='ResultA_all',index=False)
-                df_C_hourly.to_excel(writer, sheet_name='ResultC', index=False, startrow=0)
-                df_C_summary.to_excel(writer, sheet_name='ResultC',
-                                      index=False, startrow=len(df_C_hourly)+2)
+                # 1) hourly ResultT
+                df_T.to_excel(writer, sheet_name='ResultT', index=False)
+                # 2) summed ResultT
+                df_Tsum.to_excel(writer, sheet_name='ResultTsum', index=False)
+                # 3) hourly Flows
+                df_F.to_excel(writer, sheet_name='ResultF', index=False)
+                # 4) summed Flows
+                df_Fsum.to_excel(writer, sheet_name='ResultFsum', index=False)
+                # 5) hourly ResultA
+                df_A.to_excel(writer, sheet_name='ResultA', index=False)
+                # 6) summed ResultA
+                df_Asum.to_excel(writer, sheet_name='ResultAsum', index=False)
+                # 7) hourly capacity factors
+                df_C_hourly.to_excel(writer, sheet_name='ResultC', index=False)
+                # 8) summary capacity factors
+                df_C_summary.to_excel(writer, sheet_name='ResultCsum', index=False)
+
             print(f"✅ Wrote all sheets to {output.resolve()}")
             break
+
         except PermissionError:
             i += 1
             if i > 100:
